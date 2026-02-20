@@ -1,0 +1,33 @@
+{
+  "name": "@unlimiting/psc",
+  "version": "0.1.0",
+  "description": "Play Store Connect-style CLI for Google Play Developer API",
+  "type": "module",
+  "bin": {
+    "psc": "bin/psc.mjs"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node bin/psc.mjs --help",
+    "pack:check": "npm pack --dry-run"
+  },
+  "keywords": [
+    "google-play",
+    "androidpublisher",
+    "cli",
+    "release",
+    "deployment"
+  ],
+  "author": "Unlimiting",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
