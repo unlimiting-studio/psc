@@ -1,399 +1,677 @@
 #!/usr/bin/env node
 
-import { createSign } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import fs from 'node:fs';
 import path from 'node:path';
+import process from 'node:process';
+import { fileURLToPath } from 'node:url';
+import { Command } from 'commander';
+import { google } from 'googleapis';
 
-const PLAY_SCOPE = 'https://www.googleapis.com/auth/androidpublisher';
-const API_BASE = 'https://androidpublisher.googleapis.com/androidpublisher/v3';
-const UPLOAD_BASE = 'https://androidpublisher.googleapis.com/upload/androidpublisher/v3';
+const ANDROID_PUBLISHER_SCOPE = 'https://www.googleapis.com/auth/androidpublisher';
 
-const parseArgs = (argv) => {
-  const positional = [];
-  const options = {};
+class CliError extends Error {
+  constructor(message, exitCode = 1) {
+    super(message);
+    this.name = 'CliError';
+    this.exitCode = exitCode;
+  }
+}
 
-  for (let i = 0; i < argv.length; i += 1) {
-    const token = argv[i];
-    if (!token.startsWith('--')) {
-      positional.push(token);
+function readPackageVersion() {
+  try {
+    const currentDir = path.dirname(fileURLToPath(import.meta.url));
+    const packageJsonPath = path.resolve(currentDir, '../package.json');
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+    return packageJson.version || '0.1.0';
+  } catch {
+    return '0.1.0';
+  }
+}
+
+function maskValue(value, visiblePrefix = 8, visibleSuffix = 4) {
+  if (!value || typeof value !== 'string') {
+    return '(none)';
+  }
+
+  if (value.length <= visiblePrefix + visibleSuffix) {
+    return '*'.repeat(value.length);
+  }
+
+  return `${value.slice(0, visiblePrefix)}...${value.slice(-visibleSuffix)}`;
+}
+
+function resolvePackageName(candidate) {
+  const packageName = candidate || process.env.PSC_PACKAGE_NAME;
+  if (!packageName) {
+    throw new CliError('패키지명을 찾을 수 없습니다. --package-name 또는 PSC_PACKAGE_NAME을 설정하세요.');
+  }
+
+  return packageName;
+}
+
+function loadServiceAccountCredentials(explicitPath) {
+  const rawJson = process.env.PSC_SERVICE_ACCOUNT_JSON;
+  if (rawJson) {
+    let parsed;
+    try {
+      parsed = JSON.parse(rawJson);
+    } catch {
+      throw new CliError('PSC_SERVICE_ACCOUNT_JSON 값이 유효한 JSON이 아닙니다.');
+    }
+
+    validateServiceAccount(parsed);
+    return {
+      credentials: parsed,
+      source: 'PSC_SERVICE_ACCOUNT_JSON',
+    };
+  }
+
+  const credentialsPath =
+    explicitPath ||
+    process.env.PSC_SERVICE_ACCOUNT_JSON_PATH ||
+    process.env.GOOGLE_APPLICATION_CREDENTIALS;
+
+  if (!credentialsPath) {
+    throw new CliError(
+      '서비스 계정 자격증명을 찾을 수 없습니다. --credentials, PSC_SERVICE_ACCOUNT_JSON_PATH, GOOGLE_APPLICATION_CREDENTIALS 중 하나를 설정하세요.',
+    );
+  }
+
+  const resolvedPath = path.resolve(credentialsPath);
+  if (!fs.existsSync(resolvedPath)) {
+    throw new CliError(`서비스 계정 파일이 존재하지 않습니다: ${resolvedPath}`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
+  } catch {
+    throw new CliError(`서비스 계정 파일 JSON 파싱 실패: ${resolvedPath}`);
+  }
+
+  validateServiceAccount(parsed);
+
+  return {
+    credentials: parsed,
+    source: resolvedPath,
+  };
+}
+
+function validateServiceAccount(credentials) {
+  if (!credentials || typeof credentials !== 'object') {
+    throw new CliError('서비스 계정 자격증명 형식이 유효하지 않습니다.');
+  }
+
+  if (!credentials.client_email || !credentials.private_key) {
+    throw new CliError('서비스 계정 자격증명에 client_email 또는 private_key가 없습니다.');
+  }
+}
+
+async function createContext(options = {}, requirePackage = false) {
+  const { credentials, source } = loadServiceAccountCredentials(options.credentials);
+
+  const auth = new google.auth.JWT({
+    email: credentials.client_email,
+    key: credentials.private_key,
+    scopes: [ANDROID_PUBLISHER_SCOPE],
+    subject: options.subject || process.env.PSC_IMPERSONATE_SUBJECT || undefined,
+  });
+
+  await auth.authorize();
+
+  const api = google.androidpublisher({
+    version: 'v3',
+    auth,
+  });
+
+  return {
+    api,
+    auth,
+    credentials,
+    credentialsSource: source,
+    packageName: requirePackage ? resolvePackageName(options.packageName) : options.packageName || process.env.PSC_PACKAGE_NAME || null,
+  };
+}
+
+async function getAccessToken(auth) {
+  const fromCredentials = auth.credentials?.access_token;
+  if (fromCredentials) {
+    return fromCredentials;
+  }
+
+  const tokenResponse = await auth.getAccessToken();
+
+  if (typeof tokenResponse === 'string') {
+    return tokenResponse;
+  }
+
+  if (tokenResponse && typeof tokenResponse === 'object' && typeof tokenResponse.token === 'string') {
+    return tokenResponse.token;
+  }
+
+  return null;
+}
+
+function collectValues(value, previous) {
+  if (!previous) {
+    return [value];
+  }
+
+  previous.push(value);
+  return previous;
+}
+
+function parseVersionCodes(rawValues) {
+  const values = Array.isArray(rawValues) ? rawValues : [rawValues];
+  const versionCodes = [];
+
+  for (const value of values) {
+    if (typeof value !== 'string') {
       continue;
     }
 
-    const normalized = token.slice(2);
-    const [rawKey, rawInlineValue] = normalized.split('=', 2);
-    const key = rawKey.trim();
-    if (!key) continue;
+    for (const item of value.split(',')) {
+      const trimmed = item.trim();
+      if (!trimmed) {
+        continue;
+      }
 
-    const next = argv[i + 1];
-    if (rawInlineValue !== undefined) {
-      options[key] = rawInlineValue;
-      continue;
+      if (!/^\d+$/.test(trimmed)) {
+        throw new CliError(`유효하지 않은 versionCode: ${trimmed}`);
+      }
+
+      versionCodes.push(trimmed);
+    }
+  }
+
+  if (versionCodes.length === 0) {
+    throw new CliError('최소 1개 이상의 --version-code가 필요합니다.');
+  }
+
+  return [...new Set(versionCodes)];
+}
+
+function parseUserFraction(raw) {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0 || value >= 1) {
+    throw new CliError('--user-fraction은 0보다 크고 1보다 작은 값이어야 합니다.');
+  }
+
+  return value;
+}
+
+function parseInAppUpdatePriority(raw) {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0 || value > 5) {
+    throw new CliError('--in-app-update-priority는 0~5 정수여야 합니다.');
+  }
+
+  return value;
+}
+
+function loadReleaseNotes(filePath) {
+  if (!filePath) {
+    return undefined;
+  }
+
+  const resolvedPath = path.resolve(filePath);
+  if (!fs.existsSync(resolvedPath)) {
+    throw new CliError(`release notes 파일이 존재하지 않습니다: ${resolvedPath}`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
+  } catch {
+    throw new CliError(`release notes JSON 파싱 실패: ${resolvedPath}`);
+  }
+
+  if (Array.isArray(parsed)) {
+    const notes = parsed.map((entry) => ({
+      language: entry?.language,
+      text: entry?.text,
+    }));
+
+    for (const note of notes) {
+      if (!note.language || !note.text) {
+        throw new CliError('release notes 배열 항목은 language, text를 모두 포함해야 합니다.');
+      }
     }
 
-    if (next && !next.startsWith('--')) {
-      options[key] = next;
-      i += 1;
-      continue;
+    return notes;
+  }
+
+  if (parsed && typeof parsed === 'object') {
+    const notes = Object.entries(parsed).map(([language, text]) => ({
+      language,
+      text: String(text),
+    }));
+
+    if (notes.length === 0) {
+      throw new CliError('release notes 객체가 비어 있습니다.');
     }
 
-    options[key] = true;
+    return notes;
   }
 
-  return { positional, options };
-};
+  throw new CliError('release notes는 배열 또는 객체(JSON) 형식이어야 합니다.');
+}
 
-const boolOpt = (value, fallback = undefined) => {
-  if (value === undefined) return fallback;
-  const v = String(value).toLowerCase().trim();
-  if (v === '1' || v === 'true') return true;
-  if (v === '0' || v === 'false') return false;
-  throw new Error(`boolean parse failed: ${value}`);
-};
+function buildReleaseFromOptions(options, versionCodes) {
+  const status = options.status || 'completed';
+  const allowedStatuses = new Set(['draft', 'inProgress', 'halted', 'completed']);
 
-const required = (options, key, envKey) => {
-  const value = options[key] ?? (envKey ? process.env[envKey] : undefined);
-  if (!value || String(value).trim().length === 0) {
-    throw new Error(`missing required option: --${key}${envKey ? ` or ${envKey}` : ''}`);
-  }
-  return String(value).trim();
-};
-
-const toBase64Url = (input) =>
-  Buffer.from(input)
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/g, '');
-
-const buildJwt = ({ header, payload, privateKeyPem }) => {
-  const encodedHeader = toBase64Url(JSON.stringify(header));
-  const encodedPayload = toBase64Url(JSON.stringify(payload));
-  const signingInput = `${encodedHeader}.${encodedPayload}`;
-
-  const signer = createSign('RSA-SHA256');
-  signer.update(signingInput);
-  signer.end();
-  const signature = signer.sign(privateKeyPem);
-
-  return `${signingInput}.${toBase64Url(signature)}`;
-};
-
-const normalizePrivateKey = (raw) => (raw.includes('\\n') ? raw.replace(/\\n/g, '\n') : raw);
-
-const readServiceAccount = async (options) => {
-  const fromFile = options['service-account-json'] ?? process.env.PLAY_SERVICE_ACCOUNT_JSON_PATH;
-  if (fromFile) {
-    const raw = await readFile(path.resolve(String(fromFile)), 'utf8');
-    return JSON.parse(raw);
+  if (!allowedStatuses.has(status)) {
+    throw new CliError(`유효하지 않은 release status: ${status}`);
   }
 
-  const inline = options['service-account-json-inline'] ?? process.env.PLAY_SERVICE_ACCOUNT_JSON;
-  if (inline) {
-    return JSON.parse(String(inline));
-  }
-
-  throw new Error(
-    'service account JSON is required: --service-account-json or PLAY_SERVICE_ACCOUNT_JSON_PATH',
-  );
-};
-
-const exchangeAccessToken = async (serviceAccount) => {
-  const now = Math.floor(Date.now() / 1000);
-  const assertion = buildJwt({
-    header: { alg: 'RS256', typ: 'JWT' },
-    payload: {
-      iss: serviceAccount.client_email,
-      scope: PLAY_SCOPE,
-      aud: 'https://oauth2.googleapis.com/token',
-      iat: now,
-      exp: now + 3600,
-    },
-    privateKeyPem: normalizePrivateKey(serviceAccount.private_key),
-  });
-
-  const body = new URLSearchParams({
-    grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-    assertion,
-  });
-
-  const response = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
-  });
-
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`oauth token exchange failed (${response.status}): ${detail}`);
-  }
-
-  return response.json();
-};
-
-const jsonRequest = async (url, init = {}) => {
-  const res = await fetch(url, init);
-  const contentType = res.headers.get('content-type') || '';
-  const body = contentType.includes('application/json') ? await res.json() : await res.text();
-
-  if (!res.ok) {
-    const detail = typeof body === 'string' ? body : JSON.stringify(body, null, 2);
-    throw new Error(`HTTP ${res.status} ${res.statusText}\n${detail}`);
-  }
-
-  return body;
-};
-
-const withAuth = (accessToken, contentType = 'application/json') => ({
-  Authorization: `Bearer ${accessToken}`,
-  Accept: 'application/json',
-  ...(contentType ? { 'Content-Type': contentType } : {}),
-});
-
-const editsCreate = ({ packageName, accessToken }) =>
-  jsonRequest(`${API_BASE}/applications/${packageName}/edits`, {
-    method: 'POST',
-    headers: withAuth(accessToken),
-    body: JSON.stringify({}),
-  });
-
-const editsValidate = ({ packageName, editId, accessToken }) =>
-  jsonRequest(`${API_BASE}/applications/${packageName}/edits/${editId}:validate`, {
-    method: 'POST',
-    headers: withAuth(accessToken),
-    body: JSON.stringify({}),
-  });
-
-const editsCommit = ({ packageName, editId, accessToken, changesNotSentForReview }) => {
-  const url = new URL(`${API_BASE}/applications/${packageName}/edits/${editId}:commit`);
-  if (changesNotSentForReview !== undefined) {
-    url.searchParams.set('changesNotSentForReview', String(changesNotSentForReview));
-  }
-
-  return jsonRequest(url.toString(), {
-    method: 'POST',
-    headers: withAuth(accessToken),
-    body: JSON.stringify({}),
-  });
-};
-
-const bundlesUpload = async ({ packageName, editId, aabPath, accessToken }) => {
-  const buffer = await readFile(path.resolve(aabPath));
-  return jsonRequest(
-    `${UPLOAD_BASE}/applications/${packageName}/edits/${editId}/bundles?uploadType=media`,
-    {
-      method: 'POST',
-      headers: withAuth(accessToken, 'application/octet-stream'),
-      body: buffer,
-    },
-  );
-};
-
-const tracksGet = ({ packageName, editId, track, accessToken }) =>
-  jsonRequest(`${API_BASE}/applications/${packageName}/edits/${editId}/tracks/${encodeURIComponent(track)}`, {
-    method: 'GET',
-    headers: withAuth(accessToken),
-  });
-
-const tracksUpdate = ({
-  packageName,
-  editId,
-  track,
-  versionCodes,
-  status,
-  releaseName,
-  releaseNotes,
-  userFraction,
-  inAppUpdatePriority,
-  accessToken,
-}) => {
   const release = {
     status,
-    versionCodes: versionCodes.map((v) => String(v)),
-    ...(releaseName ? { name: releaseName } : {}),
-    ...(releaseNotes ? { releaseNotes: [{ language: 'ko-KR', text: releaseNotes }] } : {}),
-    ...(userFraction !== undefined ? { userFraction } : {}),
-    ...(inAppUpdatePriority !== undefined ? { inAppUpdatePriority } : {}),
+    versionCodes,
   };
 
-  return jsonRequest(
-    `${API_BASE}/applications/${packageName}/edits/${editId}/tracks/${encodeURIComponent(track)}`,
-    {
-      method: 'PUT',
-      headers: withAuth(accessToken),
-      body: JSON.stringify({ track, releases: [release] }),
-    },
-  );
-};
-
-const print = (value) => console.log(JSON.stringify(value, null, 2));
-
-const help = () => {
-  console.log(`psc - Play Store Connect CLI (ASC style)\n\nUSAGE\n  psc <group> <command> [flags]\n\nGROUPS\n  auth      token/auth check\n  edits     create/validate/commit edits\n  bundles   upload AAB\n  tracks    get/update tracks\n  publish   one-shot submit (create->upload->track->validate->commit)\n\nCOMMON FLAGS\n  --service-account-json / PLAY_SERVICE_ACCOUNT_JSON_PATH\n  --service-account-json-inline / PLAY_SERVICE_ACCOUNT_JSON\n\nCOMMANDS\n  auth token\n  auth status --package-name <packageName>\n\n  edits create --package-name <packageName>\n  edits validate --package-name <packageName> --edit-id <editId>\n  edits commit --package-name <packageName> --edit-id <editId> [--changes-not-sent-for-review=true|false]\n\n  bundles upload --package-name <packageName> --edit-id <editId> --aab <path/to/app.aab>\n\n  tracks get --package-name <packageName> --edit-id <editId> --track internal\n  tracks update --package-name <packageName> --edit-id <editId> --track internal --version-codes 1234 --status completed\n\n  publish submit --package-name <packageName> --aab <path> --track internal [--status completed]\n`);
-};
-
-const parseVersionCodes = (raw) =>
-  String(raw)
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-const main = async () => {
-  const { positional, options } = parseArgs(process.argv.slice(2));
-  const [group, command] = positional;
-
-  if (!group || options.help || options.h) {
-    help();
-    return;
+  if (options.releaseName) {
+    release.name = options.releaseName;
   }
 
-  const serviceAccount = await readServiceAccount(options);
-  const tokenResult = await exchangeAccessToken(serviceAccount);
-  const accessToken = tokenResult.access_token;
-
-  if (!accessToken) {
-    throw new Error('could not obtain access token');
+  const userFraction = parseUserFraction(options.userFraction);
+  if (userFraction !== undefined) {
+    release.userFraction = userFraction;
   }
 
-  if (group === 'auth' && command === 'token') {
-    print({
-      tokenType: tokenResult.token_type,
-      expiresIn: tokenResult.expires_in,
-      accessToken: String(accessToken).slice(0, 12) + '...',
-    });
-    return;
+  if (status === 'inProgress' && userFraction === undefined) {
+    throw new CliError('status가 inProgress인 경우 --user-fraction이 필요합니다.');
   }
 
-  if (group === 'auth' && command === 'status') {
-    const packageName = required(options, 'package-name', 'PLAY_PACKAGE_NAME');
-    const edit = await editsCreate({ packageName, accessToken });
-    print({ ok: true, packageName, editId: edit.id, auth: 'valid' });
-    return;
+  const updatePriority = parseInAppUpdatePriority(options.inAppUpdatePriority);
+  if (updatePriority !== undefined) {
+    release.inAppUpdatePriority = updatePriority;
   }
 
-  if (group === 'edits' && command === 'create') {
-    const packageName = required(options, 'package-name', 'PLAY_PACKAGE_NAME');
-    print(await editsCreate({ packageName, accessToken }));
-    return;
+  const releaseNotes = loadReleaseNotes(options.releaseNotesFile);
+  if (releaseNotes) {
+    release.releaseNotes = releaseNotes;
   }
 
-  if (group === 'edits' && command === 'validate') {
-    const packageName = required(options, 'package-name', 'PLAY_PACKAGE_NAME');
-    const editId = required(options, 'edit-id');
-    print(await editsValidate({ packageName, editId, accessToken }));
-    return;
+  return release;
+}
+
+function ensureAabFile(aabPath) {
+  if (!aabPath) {
+    throw new CliError('--aab 옵션이 필요합니다.');
   }
 
-  if (group === 'edits' && command === 'commit') {
-    const packageName = required(options, 'package-name', 'PLAY_PACKAGE_NAME');
-    const editId = required(options, 'edit-id');
-    const changesNotSentForReview = boolOpt(options['changes-not-sent-for-review']);
-    print(await editsCommit({ packageName, editId, accessToken, changesNotSentForReview }));
-    return;
+  const resolvedPath = path.resolve(aabPath);
+  if (!fs.existsSync(resolvedPath)) {
+    throw new CliError(`AAB 파일이 존재하지 않습니다: ${resolvedPath}`);
   }
 
-  if (group === 'bundles' && command === 'upload') {
-    const packageName = required(options, 'package-name', 'PLAY_PACKAGE_NAME');
-    const editId = required(options, 'edit-id');
-    const aabPath = required(options, 'aab');
-    print(await bundlesUpload({ packageName, editId, aabPath, accessToken }));
-    return;
+  const stats = fs.statSync(resolvedPath);
+  if (!stats.isFile()) {
+    throw new CliError(`AAB 경로가 파일이 아닙니다: ${resolvedPath}`);
   }
 
-  if (group === 'tracks' && command === 'get') {
-    const packageName = required(options, 'package-name', 'PLAY_PACKAGE_NAME');
-    const editId = required(options, 'edit-id');
-    const track = required(options, 'track');
-    print(await tracksGet({ packageName, editId, track, accessToken }));
-    return;
+  return resolvedPath;
+}
+
+function normalizeGoogleApiError(error) {
+  if (error instanceof CliError) {
+    return error;
   }
 
-  if (group === 'tracks' && command === 'update') {
-    const packageName = required(options, 'package-name', 'PLAY_PACKAGE_NAME');
-    const editId = required(options, 'edit-id');
-    const track = required(options, 'track');
-    const versionCodes = parseVersionCodes(required(options, 'version-codes'));
-    const status = options.status ? String(options.status) : 'completed';
-    const releaseName = options['release-name'] ? String(options['release-name']) : undefined;
-    const releaseNotes = options['release-notes'] ? String(options['release-notes']) : undefined;
-    const userFraction = options['user-fraction'] ? Number(options['user-fraction']) : undefined;
-    const inAppUpdatePriority = options['in-app-update-priority']
-      ? Number(options['in-app-update-priority'])
-      : undefined;
+  const status = error?.response?.status;
+  const responseError = error?.response?.data?.error;
+  const apiMessage = responseError?.message;
 
-    print(
-      await tracksUpdate({
-        packageName,
-        editId,
-        track,
-        versionCodes,
-        status,
-        releaseName,
-        releaseNotes,
-        userFraction,
-        inAppUpdatePriority,
-        accessToken,
+  let message = apiMessage || error?.message || '알 수 없는 오류가 발생했습니다.';
+
+  if (status) {
+    message = `[HTTP ${status}] ${message}`;
+  }
+
+  return new CliError(message);
+}
+
+function addAuthOptions(command) {
+  return command
+    .option('--credentials <path>', '서비스 계정 JSON 파일 경로')
+    .option('--subject <email>', '도메인 전체 위임 시 impersonation 대상 이메일');
+}
+
+function addPackageOption(command) {
+  return command.option('--package-name <name>', 'Android package name (예: com.example.app)');
+}
+
+const program = new Command();
+program
+  .name('psc')
+  .description('Google Play Developer API CLI (Edits workflow)')
+  .version(readPackageVersion())
+  .showHelpAfterError();
+
+const authCommand = program.command('auth').description('인증 관련 명령');
+
+addAuthOptions(
+  authCommand
+    .command('token')
+    .description('액세스 토큰 발급 상태 확인 (토큰은 마스킹 출력)')
+    .action(async (options) => {
+      const { auth, credentials, credentialsSource } = await createContext(options, false);
+      const token = await getAccessToken(auth);
+      if (!token) {
+        throw new CliError('액세스 토큰 발급에 실패했습니다.');
+      }
+
+      const expiresAt = auth.credentials?.expiry_date
+        ? new Date(auth.credentials.expiry_date).toISOString()
+        : '(unknown)';
+
+      console.log(`serviceAccount: ${credentials.client_email}`);
+      console.log(`credentialsSource: ${credentialsSource}`);
+      console.log(`accessToken: ${maskValue(token, 10, 6)}`);
+      console.log(`expiresAt: ${expiresAt}`);
+    }),
+);
+
+addPackageOption(
+  addAuthOptions(
+    authCommand
+      .command('status')
+      .description('인증 및 패키지 접근 권한 확인')
+      .action(async (options) => {
+        const { auth, api, credentials, credentialsSource, packageName } = await createContext(options, false);
+        const token = await getAccessToken(auth);
+
+        console.log(`serviceAccount: ${credentials.client_email}`);
+        console.log(`credentialsSource: ${credentialsSource}`);
+        console.log(`tokenIssued: ${token ? 'yes' : 'no'}`);
+        if (token) {
+          console.log(`accessToken: ${maskValue(token, 10, 6)}`);
+        }
+
+        const expiresAt = auth.credentials?.expiry_date
+          ? new Date(auth.credentials.expiry_date).toISOString()
+          : '(unknown)';
+        console.log(`expiresAt: ${expiresAt}`);
+
+        if (!packageName) {
+          console.log('packageAccess: skipped (--package-name 또는 PSC_PACKAGE_NAME 필요)');
+          return;
+        }
+
+        const response = await api.edits.insert({
+          packageName,
+          requestBody: {},
+        });
+
+        console.log('packageAccess: ok');
+        console.log(`packageName: ${packageName}`);
+        console.log(`probeEditId: ${response.data.id || '(none)'}`);
+        console.log(`probeEditExpiry: ${response.data.expiryTimeSeconds || '(none)'}`);
+        console.log('note: probe edit는 commit하지 않았습니다.');
       }),
-    );
-    return;
+  ),
+);
+
+const editsCommand = program.command('edits').description('Google Play edits 관리');
+
+addPackageOption(
+  addAuthOptions(
+    editsCommand
+      .command('create')
+      .description('새 edit 생성')
+      .action(async (options) => {
+        const { api, packageName } = await createContext(options, true);
+
+        const response = await api.edits.insert({
+          packageName,
+          requestBody: {},
+        });
+
+        console.log(`packageName: ${packageName}`);
+        console.log(`editId: ${response.data.id || '(none)'}`);
+        console.log(`expiryTimeSeconds: ${response.data.expiryTimeSeconds || '(none)'}`);
+      }),
+  ),
+);
+
+addPackageOption(
+  addAuthOptions(
+    editsCommand
+      .command('validate')
+      .description('edit validate')
+      .requiredOption('--edit-id <id>', 'edit id')
+      .action(async (options) => {
+        const { api, packageName } = await createContext(options, true);
+
+        const response = await api.edits.validate({
+          packageName,
+          editId: options.editId,
+        });
+
+        console.log(`packageName: ${packageName}`);
+        console.log(`editId: ${options.editId}`);
+        console.log(`validated: ${response.data.id ? 'yes' : 'yes'}`);
+      }),
+  ),
+);
+
+addPackageOption(
+  addAuthOptions(
+    editsCommand
+      .command('commit')
+      .description('edit commit')
+      .requiredOption('--edit-id <id>', 'edit id')
+      .option('--changes-not-sent-for-review', 'Google Play 검토 제출 없이 변경 반영')
+      .action(async (options) => {
+        const { api, packageName } = await createContext(options, true);
+
+        const response = await api.edits.commit({
+          packageName,
+          editId: options.editId,
+          changesNotSentForReview: Boolean(options.changesNotSentForReview),
+        });
+
+        console.log(`packageName: ${packageName}`);
+        console.log(`editId: ${response.data.id || options.editId}`);
+        console.log(`committed: yes`);
+      }),
+  ),
+);
+
+const bundlesCommand = program.command('bundles').description('AAB 업로드');
+
+addPackageOption(
+  addAuthOptions(
+    bundlesCommand
+      .command('upload')
+      .description('edit에 AAB 업로드')
+      .requiredOption('--edit-id <id>', 'edit id')
+      .requiredOption('--aab <path>', '.aab 파일 경로')
+      .action(async (options) => {
+        const { api, packageName } = await createContext(options, true);
+        const aabPath = ensureAabFile(options.aab);
+
+        const response = await api.edits.bundles.upload({
+          packageName,
+          editId: options.editId,
+          media: {
+            mimeType: 'application/octet-stream',
+            body: fs.createReadStream(aabPath),
+          },
+        });
+
+        console.log(`packageName: ${packageName}`);
+        console.log(`editId: ${options.editId}`);
+        console.log(`aabPath: ${aabPath}`);
+        console.log(`versionCode: ${response.data.versionCode || '(none)'}`);
+        if (response.data.sha1) {
+          console.log(`sha1: ${response.data.sha1}`);
+        }
+        if (response.data.sha256) {
+          console.log(`sha256: ${response.data.sha256}`);
+        }
+      }),
+  ),
+);
+
+const tracksCommand = program.command('tracks').description('트랙 조회/업데이트');
+
+addPackageOption(
+  addAuthOptions(
+    tracksCommand
+      .command('get')
+      .description('트랙 정보 조회')
+      .requiredOption('--edit-id <id>', 'edit id')
+      .requiredOption('--track <track>', '트랙 (internal, alpha, beta, production 등)')
+      .action(async (options) => {
+        const { api, packageName } = await createContext(options, true);
+
+        const response = await api.edits.tracks.get({
+          packageName,
+          editId: options.editId,
+          track: options.track,
+        });
+
+        console.log(JSON.stringify(response.data, null, 2));
+      }),
+  ),
+);
+
+addPackageOption(
+  addAuthOptions(
+    tracksCommand
+      .command('update')
+      .description('트랙 릴리스 업데이트')
+      .requiredOption('--edit-id <id>', 'edit id')
+      .requiredOption('--track <track>', '트랙 (internal, alpha, beta, production 등)')
+      .option('--version-code <code>', '배포할 versionCode (반복 또는 comma 구분)', collectValues, [])
+      .option('--status <status>', 'release status (draft|inProgress|halted|completed)', 'completed')
+      .option('--release-name <name>', 'release name')
+      .option('--user-fraction <fraction>', 'inProgress 비율 (0~1 사이, 0/1 제외)')
+      .option('--in-app-update-priority <priority>', 'in-app update priority (0~5)')
+      .option('--release-notes-file <path>', 'release notes JSON 파일')
+      .action(async (options) => {
+        const { api, packageName } = await createContext(options, true);
+        const versionCodes = parseVersionCodes(options.versionCode);
+        const release = buildReleaseFromOptions(options, versionCodes);
+
+        const response = await api.edits.tracks.update({
+          packageName,
+          editId: options.editId,
+          track: options.track,
+          requestBody: {
+            track: options.track,
+            releases: [release],
+          },
+        });
+
+        console.log(JSON.stringify(response.data, null, 2));
+      }),
+  ),
+);
+
+const publishCommand = program.command('publish').description('전체 배포 플로우');
+
+addPackageOption(
+  addAuthOptions(
+    publishCommand
+      .command('submit')
+      .description('create -> upload -> track update -> validate -> commit')
+      .requiredOption('--aab <path>', '.aab 파일 경로')
+      .requiredOption('--track <track>', '트랙 (internal, alpha, beta, production 등)')
+      .option('--status <status>', 'release status (draft|inProgress|halted|completed)', 'completed')
+      .option('--release-name <name>', 'release name')
+      .option('--user-fraction <fraction>', 'inProgress 비율 (0~1 사이, 0/1 제외)')
+      .option('--in-app-update-priority <priority>', 'in-app update priority (0~5)')
+      .option('--release-notes-file <path>', 'release notes JSON 파일')
+      .option('--changes-not-sent-for-review', 'Google Play 검토 제출 없이 변경 반영')
+      .action(async (options) => {
+        const { api, packageName } = await createContext(options, true);
+        const aabPath = ensureAabFile(options.aab);
+
+        const createResponse = await api.edits.insert({
+          packageName,
+          requestBody: {},
+        });
+        const editId = createResponse.data.id;
+
+        if (!editId) {
+          throw new CliError('edit 생성에 실패했습니다. editId가 없습니다.');
+        }
+
+        const uploadResponse = await api.edits.bundles.upload({
+          packageName,
+          editId,
+          media: {
+            mimeType: 'application/octet-stream',
+            body: fs.createReadStream(aabPath),
+          },
+        });
+
+        const uploadedVersionCode = uploadResponse.data.versionCode;
+        if (!uploadedVersionCode) {
+          throw new CliError('AAB 업로드 응답에 versionCode가 없습니다.');
+        }
+
+        const release = buildReleaseFromOptions(options, [String(uploadedVersionCode)]);
+
+        const trackResponse = await api.edits.tracks.update({
+          packageName,
+          editId,
+          track: options.track,
+          requestBody: {
+            track: options.track,
+            releases: [release],
+          },
+        });
+
+        await api.edits.validate({
+          packageName,
+          editId,
+        });
+
+        const commitResponse = await api.edits.commit({
+          packageName,
+          editId,
+          changesNotSentForReview: Boolean(options.changesNotSentForReview),
+        });
+
+        console.log(`packageName: ${packageName}`);
+        console.log(`editId: ${editId}`);
+        console.log(`aabPath: ${aabPath}`);
+        console.log(`uploadedVersionCode: ${uploadedVersionCode}`);
+        console.log(`track: ${options.track}`);
+        console.log(`releaseStatus: ${release.status}`);
+        console.log(`validated: yes`);
+        console.log(`committed: yes`);
+
+        const committedEditId = commitResponse.data.id || editId;
+        console.log(`committedEditId: ${committedEditId}`);
+
+        if (trackResponse.data?.releases?.length) {
+          console.log(`trackReleases: ${trackResponse.data.releases.length}`);
+        }
+      }),
+  ),
+);
+
+async function main() {
+  try {
+    await program.parseAsync(process.argv);
+  } catch (error) {
+    const normalized = normalizeGoogleApiError(error);
+    console.error(`Error: ${normalized.message}`);
+    process.exit(normalized.exitCode || 1);
   }
+}
 
-  if (group === 'publish' && command === 'submit') {
-    const packageName = required(options, 'package-name', 'PLAY_PACKAGE_NAME');
-    const aabPath = required(options, 'aab');
-    const track = options.track ? String(options.track) : 'internal';
-    const status = options.status ? String(options.status) : 'completed';
-    const releaseName = options['release-name'] ? String(options['release-name']) : undefined;
-    const releaseNotes = options['release-notes'] ? String(options['release-notes']) : undefined;
-    const userFraction = options['user-fraction'] ? Number(options['user-fraction']) : undefined;
-    const inAppUpdatePriority = options['in-app-update-priority']
-      ? Number(options['in-app-update-priority'])
-      : undefined;
-    const changesNotSentForReview = boolOpt(options['changes-not-sent-for-review']);
-
-    const edit = await editsCreate({ packageName, accessToken });
-    const editId = edit.id;
-    if (!editId) throw new Error('edit create failed: missing editId');
-
-    const uploaded = await bundlesUpload({ packageName, editId, aabPath, accessToken });
-    const versionCode = uploaded.versionCode;
-    if (!versionCode) throw new Error('bundle upload failed: missing versionCode');
-
-    const trackResult = await tracksUpdate({
-      packageName,
-      editId,
-      track,
-      versionCodes: [versionCode],
-      status,
-      releaseName,
-      releaseNotes,
-      userFraction,
-      inAppUpdatePriority,
-      accessToken,
-    });
-
-    const validateResult = await editsValidate({ packageName, editId, accessToken });
-    const commitResult = await editsCommit({
-      packageName,
-      editId,
-      accessToken,
-      changesNotSentForReview,
-    });
-
-    print({
-      editId,
-      upload: uploaded,
-      track: trackResult,
-      validate: validateResult,
-      commit: commitResult,
-    });
-    return;
-  }
-
-  throw new Error(`unsupported command: ${group} ${command ?? ''}`.trim());
-};
-
-main().catch((error) => {
-  console.error('[psc] failed');
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});
+main();

@@ -1,7 +1,7 @@
 {
   "name": "@unlimiting/psc",
   "version": "0.1.0",
-  "description": "Play Store Connect-style CLI for Google Play Developer API",
+  "description": "CLI for Google Play Developer API Edits workflow",
   "type": "module",
   "bin": {
     "psc": "bin/psc.mjs"
@@ -12,8 +12,9 @@
     "LICENSE"
   ],
   "scripts": {
+    "help": "node bin/psc.mjs --help",
     "test": "node bin/psc.mjs --help",
-    "pack:check": "npm pack --dry-run"
+    "pack:check": "npm pack"
   },
   "keywords": [
     "google-play",
@@ -29,5 +30,9 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "commander": "^14.0.2",
+    "googleapis": "^157.0.0"
   }
 }
