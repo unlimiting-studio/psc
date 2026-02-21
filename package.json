@@ -1,6 +1,6 @@
 {
   "name": "@unlimiting/psc",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "CLI for Google Play Developer API Edits workflow",
   "type": "module",
   "bin": {
