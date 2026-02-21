@@ -8,6 +8,9 @@ import { Command } from 'commander';
 import { google } from 'googleapis';
 
 const ANDROID_PUBLISHER_SCOPE = 'https://www.googleapis.com/auth/androidpublisher';
+const PSC_DIR_NAME = '.psc';
+const PSC_CONFIG_FILENAME = 'config.json';
+const PSC_SERVICE_ACCOUNT_FILENAME = 'service-account.json';
 
 class CliError extends Error {
   constructor(message, exitCode = 1) {
@@ -49,6 +52,56 @@ function resolvePackageName(candidate) {
   return packageName;
 }
 
+function resolveConfigDirectory(local = false) {
+  if (local) {
+    return path.resolve(process.cwd(), PSC_DIR_NAME);
+  }
+
+  const homeDir = process.env.HOME || process.env.USERPROFILE;
+  if (!homeDir) {
+    throw new CliError('홈 디렉터리를 찾을 수 없습니다. --local 옵션을 사용하거나 HOME 환경변수를 확인하세요.');
+  }
+
+  return path.resolve(homeDir, PSC_DIR_NAME);
+}
+
+function readStoredCredentialPathFromConfig() {
+  const explicitConfigPath = process.env.PSC_CONFIG_PATH;
+  const candidatePaths = explicitConfigPath
+    ? [path.resolve(explicitConfigPath)]
+    : [
+        path.resolve(process.cwd(), PSC_DIR_NAME, PSC_CONFIG_FILENAME),
+        path.resolve(resolveConfigDirectory(false), PSC_CONFIG_FILENAME),
+      ];
+
+  for (const configPath of candidatePaths) {
+    if (!fs.existsSync(configPath)) {
+      continue;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    } catch {
+      throw new CliError(`PSC config JSON 파싱 실패: ${configPath}`);
+    }
+
+    if (!parsed || typeof parsed !== 'object') {
+      throw new CliError(`PSC config 형식이 유효하지 않습니다: ${configPath}`);
+    }
+
+    if (typeof parsed.credentialsPath === 'string' && parsed.credentialsPath.trim()) {
+      const resolvedCredentialPath = path.resolve(path.dirname(configPath), parsed.credentialsPath);
+      return {
+        credentialsPath: resolvedCredentialPath,
+        source: configPath,
+      };
+    }
+  }
+
+  return null;
+}
+
 function loadServiceAccountCredentials(explicitPath) {
   const rawJson = process.env.PSC_SERVICE_ACCOUNT_JSON;
   if (rawJson) {
@@ -71,13 +124,16 @@ function loadServiceAccountCredentials(explicitPath) {
     process.env.PSC_SERVICE_ACCOUNT_JSON_PATH ||
     process.env.GOOGLE_APPLICATION_CREDENTIALS;
 
-  if (!credentialsPath) {
+  const storedFromConfig = credentialsPath ? null : readStoredCredentialPathFromConfig();
+  const finalCredentialsPath = credentialsPath || storedFromConfig?.credentialsPath;
+
+  if (!finalCredentialsPath) {
     throw new CliError(
-      '서비스 계정 자격증명을 찾을 수 없습니다. --credentials, PSC_SERVICE_ACCOUNT_JSON_PATH, GOOGLE_APPLICATION_CREDENTIALS 중 하나를 설정하세요.',
+      '서비스 계정 자격증명을 찾을 수 없습니다. --credentials, PSC_SERVICE_ACCOUNT_JSON_PATH, GOOGLE_APPLICATION_CREDENTIALS 또는 ~/.psc/config.json을 설정하세요.',
     );
   }
 
-  const resolvedPath = path.resolve(credentialsPath);
+  const resolvedPath = path.resolve(finalCredentialsPath);
   if (!fs.existsSync(resolvedPath)) {
     throw new CliError(`서비스 계정 파일이 존재하지 않습니다: ${resolvedPath}`);
   }
@@ -93,7 +149,7 @@ function loadServiceAccountCredentials(explicitPath) {
 
   return {
     credentials: parsed,
-    source: resolvedPath,
+    source: storedFromConfig ? `${resolvedPath} (from ${storedFromConfig.source})` : resolvedPath,
   };
 }
 
@@ -358,6 +414,67 @@ program
   .showHelpAfterError();
 
 const authCommand = program.command('auth').description('인증 관련 명령');
+
+authCommand
+  .command('login')
+  .description('서비스 계정 자격증명을 별도 폴더(~/.psc 또는 ./.psc)에 저장')
+  .requiredOption('--credentials <path>', '서비스 계정 JSON 파일 경로')
+  .option('--local', '현재 디렉터리의 .psc 폴더에 저장')
+  .option('--force', '기존 파일이 있어도 덮어쓰기')
+  .action(async (options) => {
+    const sourcePath = path.resolve(options.credentials);
+    if (!fs.existsSync(sourcePath)) {
+      throw new CliError(`서비스 계정 파일이 존재하지 않습니다: ${sourcePath}`);
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(sourcePath, 'utf8'));
+    } catch {
+      throw new CliError(`서비스 계정 파일 JSON 파싱 실패: ${sourcePath}`);
+    }
+
+    validateServiceAccount(parsed);
+
+    const configDir = resolveConfigDirectory(Boolean(options.local));
+    fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
+
+    const credentialsOutputPath = path.resolve(configDir, PSC_SERVICE_ACCOUNT_FILENAME);
+    const configPath = path.resolve(configDir, PSC_CONFIG_FILENAME);
+
+    if (!options.force && fs.existsSync(credentialsOutputPath)) {
+      throw new CliError(
+        `이미 자격증명 파일이 존재합니다: ${credentialsOutputPath}. 덮어쓰려면 --force를 사용하세요.`,
+      );
+    }
+
+    fs.writeFileSync(credentialsOutputPath, `${JSON.stringify(parsed, null, 2)}\n`, { mode: 0o600 });
+    fs.writeFileSync(
+      configPath,
+      `${JSON.stringify(
+        {
+          credentialsPath: `./${PSC_SERVICE_ACCOUNT_FILENAME}`,
+          updatedAt: new Date().toISOString(),
+        },
+        null,
+        2,
+      )}\n`,
+      { mode: 0o600 },
+    );
+
+    try {
+      fs.chmodSync(credentialsOutputPath, 0o600);
+      fs.chmodSync(configPath, 0o600);
+    } catch {
+      // 일부 OS에서는 chmod가 제한될 수 있으므로 무시
+    }
+
+    console.log(`saved: yes`);
+    console.log(`scope: ${options.local ? 'local' : 'global'}`);
+    console.log(`credentialsPath: ${credentialsOutputPath}`);
+    console.log(`configPath: ${configPath}`);
+    console.log('next: psc auth status --package-name <your.package.name>');
+  });
 
 addAuthOptions(
   authCommand

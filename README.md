@@ -30,6 +30,7 @@ npx @unlimiting/psc --help
 - `GOOGLE_APPLICATION_CREDENTIALS`: 서비스 계정 JSON 파일 경로 (표준)
 - `PSC_SERVICE_ACCOUNT_JSON_PATH`: 서비스 계정 JSON 파일 경로 (대체)
 - `PSC_SERVICE_ACCOUNT_JSON`: 서비스 계정 JSON 문자열 직접 주입
+- `PSC_CONFIG_PATH`: `psc` config 파일 경로 (기본: `./.psc/config.json` -> `~/.psc/config.json` 순서 탐색)
 - `PSC_PACKAGE_NAME`: 기본 package name (예: `com.example.app`)
 - `PSC_IMPERSONATE_SUBJECT`: 도메인 위임 사용 시 subject 이메일
 
@@ -38,9 +39,11 @@ npx @unlimiting/psc --help
 2. `--credentials`
 3. `PSC_SERVICE_ACCOUNT_JSON_PATH`
 4. `GOOGLE_APPLICATION_CREDENTIALS`
+5. `./.psc/config.json` 또는 `~/.psc/config.json`에 저장된 `credentialsPath`
 
 ## 명령 구조
 
+- `auth login --credentials` (자격증명 저장)
 - `auth token`
 - `auth status --package-name`
 - `edits create|validate|commit`
@@ -51,6 +54,25 @@ npx @unlimiting/psc --help
 ## 사용 예시
 
 ### 1) 인증 상태 확인
+
+최초 1회 로그인(저장):
+
+```bash
+# 글로벌 저장: ~/.psc/service-account.json, ~/.psc/config.json
+psc auth login --credentials ./service-account.json
+
+# 로컬 저장: ./.psc/service-account.json, ./.psc/config.json
+psc auth login --credentials ./service-account.json --local
+```
+
+저장 후에는 `--credentials` 없이 실행 가능:
+
+```bash
+psc auth token
+psc auth status --package-name com.example.app
+```
+
+즉시 경로 지정이 필요하면 기존 방식도 가능:
 
 ```bash
 psc auth token --credentials ./service-account.json
