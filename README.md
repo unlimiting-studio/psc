@@ -155,4 +155,6 @@ psc publish submit \
 - `CI`: PR/`main` push 시 `npm ci`, `npm test`, `npm pack --dry-run`
 - `Release`: 수동 실행(`workflow_dispatch`)으로 버전 입력 후 npm 배포
 
-배포 워크플로우를 쓰려면 리포지토리 시크릿에 `NPM_TOKEN`을 추가하세요.
+배포 워크플로우는 npm Trusted Publishing(OIDC) 기준입니다.
+- GitHub Actions permissions에 `id-token: write`가 필요합니다.
+- npm 패키지 설정에서 해당 GitHub 저장소/워크플로우를 Trusted Publisher로 연결해야 합니다.
