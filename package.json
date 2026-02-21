@@ -25,6 +25,14 @@
   ],
   "author": "Unlimiting",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/unlimiting-studio/psc"
+  },
+  "homepage": "https://github.com/unlimiting-studio/psc",
+  "bugs": {
+    "url": "https://github.com/unlimiting-studio/psc/issues"
+  },
   "engines": {
     "node": ">=20"
   },
