@@ -127,3 +127,10 @@ psc publish submit \
 
 - 토큰/비밀키 전체값은 출력하지 않습니다.
 - CLI 에러 로그도 민감정보를 직접 출력하지 않도록 최소화되어 있습니다.
+
+## GitHub Actions
+
+- `CI`: PR/`main` push 시 `npm ci`, `npm test`, `npm pack --dry-run`
+- `Release`: 수동 실행(`workflow_dispatch`)으로 버전 입력 후 npm 배포
+
+배포 워크플로우를 쓰려면 리포지토리 시크릿에 `NPM_TOKEN`을 추가하세요.
