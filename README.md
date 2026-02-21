@@ -128,6 +128,33 @@ psc publish submit \
 - 토큰/비밀키 전체값은 출력하지 않습니다.
 - CLI 에러 로그도 민감정보를 직접 출력하지 않도록 최소화되어 있습니다.
 
+## GitHub App + gh 래퍼 (`psc-gh`)
+
+`psc-gh`는 GitHub App 설치 토큰을 매번 발급해서 `gh` CLI를 실행합니다.
+
+기본값:
+- App ID: `2913321` (`unlimiting-sena`)
+- Installation ID: `111456446`
+- PEM 경로: `~/vault/unlimiting-sena_pk.pem`
+
+예시:
+
+```bash
+psc-gh repo view unlimiting-studio/psc
+psc-gh -- gh api /repos/unlimiting-studio/psc
+```
+
+옵션:
+- `--app-id`
+- `--installation-id`
+- `--pem-path`
+- `--token-only` (마스킹된 토큰 메타정보 출력)
+
+환경변수:
+- `UNLIMITING_SENA_APP_ID`
+- `UNLIMITING_SENA_INSTALLATION_ID`
+- `UNLIMITING_SENA_PRIVATE_KEY_PATH`
+
 ## GitHub Actions
 
 - `CI`: PR/`main` push 시 `npm ci`, `npm test`, `npm pack --dry-run`

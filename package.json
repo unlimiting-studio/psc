@@ -4,7 +4,8 @@
   "description": "CLI for Google Play Developer API Edits workflow",
   "type": "module",
   "bin": {
-    "psc": "bin/psc.mjs"
+    "psc": "bin/psc.mjs",
+    "psc-gh": "bin/psc-gh.mjs"
   },
   "files": [
     "bin",
